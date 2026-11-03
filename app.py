@@ -2,154 +2,174 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from datetime import date
 
 st.set_page_config(page_title="المحلل الذكي للبورصة المصرية", page_icon="📈", layout="wide")
+
 st.title("📈 المحلل الذكي للبورصة المصرية")
-st.caption("نسخة أولية قابلة للتشغيل على الويب — تحليل تاريخي وتعليمي، وليست توصية استثمارية.")
+st.caption("أداة تحليل ومتابعة تعليمية — ليست توصية استثمارية ولا تنفذ أوامر تداول.")
 
-with st.sidebar:
-    st.header("إعدادات التحليل")
-    symbols_text = st.text_area("رموز الأسهم (رمز في كل سطر)", "COMI.CA\nSWDY.CA\nETEL.CA\nTMGH.CA\nABUK.CA")
-    period = st.selectbox("الفترة التاريخية", ["2y", "5y", "10y"], index=1)
-    test_fraction = st.slider("نسبة بيانات الاختبار", 0.2, 0.4, 0.3, 0.05)
-    cost_pct = st.number_input("تكلفة التداول التقديرية لكل تغيير مركز (%)", min_value=0.0, max_value=2.0, value=0.2, step=0.05)
-    run = st.button("🔄 جلب البيانات وتحليل الأسهم", type="primary", use_container_width=True)
+DEFAULTS = ["COMI.CA", "SWDY.CA", "ETEL.CA", "TMGH.CA", "ABUK.CA"]
 
-st.warning("البيانات عبر Yahoo Finance قد تكون متأخرة أو ناقصة، وتوفر رموز الأسهم المصرية ليس مضمونًا. لا تعتبر النتائج أسعارًا لحظية أو توصيات شراء. تحقق من السعر ومصدره لدى وسيطك قبل أي قرار.")
+@st.cache_data(ttl=900, show_spinner=False)
+def load_data(symbol: str, period: str):
+    df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.title)
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in df.columns for c in needed):
+        return pd.DataFrame()
+    df = df[needed].dropna(subset=["Close"]).copy()
+    return df
 
-FEATURES = ["ret1", "ret5", "ret10", "vol10", "vol20", "ma_gap10", "ma_gap20", "range5"]
-def features_from_close(close):
-    df = pd.DataFrame(index=close.index)
-    df["ret1"] = close.pct_change(1)
-    df["ret5"] = close.pct_change(5)
-    df["ret10"] = close.pct_change(10)
-    df["vol10"] = df["ret1"].rolling(10).std()
-    df["vol20"] = df["ret1"].rolling(20).std()
-    df["ma_gap10"] = close / close.rolling(10).mean() - 1
-    df["ma_gap20"] = close / close.rolling(20).mean() - 1
-    df["range5"] = close.pct_change().rolling(5).max() - close.pct_change().rolling(5).min()
-    # Label is whether next session's close is higher than today's close
-    df["target"] = (close.shift(-1) > close).astype(int)
-    return df.replace([np.inf, -np.inf], np.nan).dropna()
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-def max_drawdown(equity):
-    if len(equity) == 0: return np.nan
-    peak = equity.cummax()
-    return float((equity / peak - 1).min() * 100)
+def analyze(df):
+    x = df.copy()
+    c = x["Close"]
+    x["SMA20"] = c.rolling(20).mean()
+    x["SMA50"] = c.rolling(50).mean()
+    x["RSI"] = rsi(c)
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    x["MACD"] = ema12 - ema26
+    x["MACD_Signal"] = x["MACD"].ewm(span=9, adjust=False).mean()
+    tr = pd.concat([
+        x["High"] - x["Low"],
+        (x["High"] - c.shift()).abs(),
+        (x["Low"] - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    x["ATR"] = tr.rolling(14).mean()
+    return x.dropna().copy()
 
-def analyze(symbol, period, test_fraction, cost_pct):
-    raw = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-    if raw is None or raw.empty:
-        return None, f"لم تُرجع خدمة البيانات أسعارًا للرمز {symbol}."
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    if "Close" not in raw.columns:
-        return None, f"عمود الإغلاق غير متاح للرمز {symbol}."
-    close = raw["Close"].dropna()
-    data = features_from_close(close)
-    if len(data) < 120:
-        return None, f"البيانات الصالحة قليلة للرمز {symbol} ({len(data)} جلسة فقط)."
-    X = data[FEATURES]
-    y = data["target"]
-    split = int(len(data) * (1-test_fraction))
-    if split < 80 or len(data)-split < 20:
-        return None, f"لا تكفي البيانات لتقسيم تدريب/اختبار للرمز {symbol}."
-    model = RandomForestClassifier(n_estimators=300, max_depth=5, min_samples_leaf=5,
-                                   class_weight="balanced_subsample", random_state=42)
-    model.fit(X.iloc[:split], y.iloc[:split])
-    X_test, y_test = X.iloc[split:], y.iloc[split:]
-    pred = model.predict(X_test)
-    proba = model.predict_proba(X_test)
-    classes = list(model.classes_)
-    up_idx = classes.index(1) if 1 in classes else None
-    p_up = float(model.predict_proba(X.iloc[[-1]])[0][up_idx]) if up_idx is not None else 0.0
-    acc = accuracy_score(y_test, pred) * 100
-    bacc = balanced_accuracy_score(y_test, pred) * 100
-    # Prediction formed after close at t; position is applied to return from t to t+1.
-    # Test returns are next-session returns for each feature row, computed from close[t+1]/close[t]-1.
-    test_index = X_test.index
-    close_aligned = close.reindex(data.index)
-    next_returns = close_aligned.shift(-1).div(close_aligned).sub(1).reindex(test_index)
-    positions = pd.Series(pred, index=test_index).astype(float)
-    turnover = positions.diff().abs()
-    if len(turnover): turnover.iloc[0] = abs(positions.iloc[0])
-    net_strategy = positions * next_returns - (turnover * cost_pct/100)
-    net_strategy = net_strategy.dropna()
-    bh_returns = next_returns.loc[net_strategy.index].fillna(0)
-    strat_equity = (1 + net_strategy).cumprod()
-    bh_equity = (1 + bh_returns).cumprod()
-    total_strat = (strat_equity.iloc[-1]-1)*100 if len(strat_equity) else np.nan
-    total_bh = (bh_equity.iloc[-1]-1)*100 if len(bh_equity) else np.nan
-    dd_strat = max_drawdown(strat_equity)
-    dd_bh = max_drawdown(bh_equity)
-    ann_vol = float(data.loc[test_index, "ret1"].std() * np.sqrt(252) * 100)
-    row = {
-        "السهم": symbol.replace(".CA",""),
-        "آخر إغلاق متاح": float(close.iloc[-1]),
-        "تاريخ آخر بيانات": str(close.index[-1].date()),
-        "احتمال صعود تقديري للجلسة التالية %": round(p_up*100,2),
-        "دقة الاختبار %": round(acc,2),
-        "الدقة المتوازنة %": round(bacc,2),
-        "عائد النموذج بعد التكلفة %": round(total_strat,2),
-        "أكبر تراجع للنموذج %": round(dd_strat,2),
-        "عائد الاحتفاظ خلال الاختبار %": round(total_bh,2),
-        "أكبر تراجع للاحتفاظ %": round(dd_bh,2),
-        "التقلب السنوي التقديري %": round(ann_vol,2),
-        "جلسات الاختبار": len(net_strategy)
-    }
-    # Add only a cautious interpretation, never a buy recommendation.
-    if p_up >= .60 and bacc >= 52 and total_strat > total_bh and dd_strat > -30:
-        assessment = "إشارة تستحق مراجعة إضافية"
-    elif bacc < 50 or total_strat <= total_bh:
-        assessment = "نتائج غير حاسمة / تحتاج تحسين"
+def signal_for(row):
+    score = 0
+    reasons = []
+    if row["Close"] > row["SMA20"]:
+        score += 1; reasons.append("السعر أعلى متوسط 20 يوم")
     else:
-        assessment = "مراقبة فقط"
-    row["قراءة مبدئية"] = assessment
-    chart = pd.DataFrame({"استراتيجية النموذج": strat_equity, "الاحتفاظ": bh_equity})
-    return (row, chart), None
-
-if run:
-    symbols = list(dict.fromkeys([s.strip().upper() for s in symbols_text.splitlines() if s.strip()]))
-    if not symbols:
-        st.error("اكتبي رمز سهم واحدًا على الأقل.")
+        score -= 1; reasons.append("السعر أقل متوسط 20 يوم")
+    if row["SMA20"] > row["SMA50"]:
+        score += 1; reasons.append("متوسط 20 أعلى متوسط 50")
     else:
-        results, errors, charts = [], [], {}
-        bar = st.progress(0, text="بدء التحليل...")
-        for i, sym in enumerate(symbols):
-            bar.progress((i+1)/len(symbols), text=f"تحليل {sym}...")
-            try:
-                out, err = analyze(sym, period, test_fraction, cost_pct)
-                if err: errors.append(err)
-                else:
-                    row, chart = out
-                    results.append(row)
-                    charts[row["السهم"]] = chart
-            except Exception as e:
-                errors.append(f"تعذر تحليل {sym}: {str(e)[:180]}")
-        bar.empty()
-        if results:
-            df = pd.DataFrame(results).sort_values("احتمال صعود تقديري للجلسة التالية %", ascending=False)
-            st.subheader("نتائج التحليل")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ تنزيل النتائج CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"egx_ai_report_{date.today().isoformat()}.csv", mime="text/csv")
-            st.subheader("مقارنة منحنى الاختبار")
-            selected = st.selectbox("اختاري سهمًا لعرض المنحنى", list(charts.keys()))
-            st.line_chart(charts[selected], use_container_width=True)
-            st.info("الاحتمال يخص الجلسة التالية وفق النموذج، وليس ضمانًا. الاختبار التاريخي لا يضمن الأداء المستقبلي، كما أن جودة البيانات وتكاليف التنفيذ قد تختلف عن الافتراضات.")
-        if errors:
-            st.subheader("ملاحظات على البيانات")
-            for msg in errors: st.warning(msg)
-else:
-    st.info("اضغطي «جلب البيانات وتحليل الأسهم» لبدء التحليل. يتطلب الاتصال بالإنترنت ومصدر البيانات أن يكون متاحًا.")
-    st.subheader("ما الذي يفعله النموذج؟")
-    st.markdown("""
-    - يبني ميزات من عوائد الأسعار والتقلب والمتوسطات المتحركة.
-    - يتدرب على الجزء الأقدم من البيانات ويختبر على جزء أحدث.
-    - يقارن استراتيجية طويلة فقط بالاحتفاظ بالسهم، مع تكلفة تداول افتراضية.
-    - يعرض تاريخ آخر بيانات لتقليل خطر الاعتماد على أسعار قديمة.
-    """)
-st.caption("نسخة تجريبية: لا تنفذ أوامر بيع أو شراء، ولا تطلب بيانات دخول للوسيط، ولا تحفظ مفاتيح أو معلومات مالية شخصية.")
+        score -= 1; reasons.append("متوسط 20 أقل متوسط 50")
+    if row["MACD"] > row["MACD_Signal"]:
+        score += 1; reasons.append("تقاطع MACD إيجابي")
+    else:
+        score -= 1; reasons.append("MACD دون خط الإشارة")
+    if row["RSI"] < 30:
+        score += 1; reasons.append("RSI يشير إلى تشبع بيعي")
+    elif row["RSI"] > 70:
+        score -= 1; reasons.append("RSI يشير إلى تشبع شرائي")
+    if score >= 2:
+        label = "إيجابية بحذر"
+    elif score <= -2:
+        label = "سلبية / تجنب التسرع"
+    else:
+        label = "انتظار"
+    return label, score, reasons
+
+st.sidebar.header("إعدادات التحليل")
+symbols_text = st.sidebar.text_area("رموز الأسهم (افصلي بينها بفاصلة)", ", ".join(DEFAULTS))
+symbols = list(dict.fromkeys(s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()))
+period = st.sidebar.selectbox("الفترة التاريخية", ["6mo", "1y", "2y", "5y"], index=3)
+cost_pct = st.sidebar.number_input("تكلفة التداول التقديرية لكل عملية (%)", min_value=0.0, max_value=5.0, value=0.20, step=0.05)
+st.sidebar.caption("مصدر الأسعار: Yahoo Finance عبر yfinance. قد لا تتوفر بعض رموز EGX أو قد تتأخر البيانات.")
+
+if st.button("🔄 جلب البيانات وتحليل الأسهم", type="primary", use_container_width=True):
+    st.cache_data.clear()
+
+if not symbols:
+    st.info("أضيفي رمز سهم واحدًا على الأقل.")
+    st.stop()
+
+rows = []
+details = []
+progress = st.progress(0)
+status = st.empty()
+
+for i, sym in enumerate(symbols):
+    status.write(f"جاري تحميل وتحليل {sym} ...")
+    try:
+        raw = load_data(sym, period)
+        if raw.empty or len(raw) < 60:
+            details.append((sym, None, "لا توجد بيانات كافية أو الرمز غير مدعوم من مصدر البيانات."))
+        else:
+            data = analyze(raw)
+            if data.empty:
+                details.append((sym, None, "البيانات غير كافية لحساب المؤشرات."))
+            else:
+                last = data.iloc[-1]
+                label, score, reasons = signal_for(last)
+                atr = float(last["ATR"])
+                close = float(last["Close"])
+                # مستويات تعليمية مبنية على ATR وليست توقعات مؤكدة
+                stop = max(0.0, close - 1.5 * atr)
+                target = close + 2.0 * atr
+                rows.append({
+                    "السهم": sym,
+                    "آخر إغلاق": round(close, 3),
+                    "تاريخ البيانات": data.index[-1].strftime("%Y-%m-%d"),
+                    "RSI": round(float(last["RSI"]), 1),
+                    "MACD": round(float(last["MACD"]), 3),
+                    "متوسط 20": round(float(last["SMA20"]), 3),
+                    "متوسط 50": round(float(last["SMA50"]), 3),
+                    "الإشارة الفنية": label,
+                    "درجة الإشارة": score,
+                    "وقف خسارة تعليمي": round(stop, 3),
+                    "هدف تعليمي": round(target, 3),
+                })
+                details.append((sym, data, reasons))
+    except Exception as e:
+        details.append((sym, None, f"تعذر التحميل: {str(e)[:160]}"))
+    progress.progress((i + 1) / len(symbols))
+
+progress.empty()
+status.empty()
+
+if rows:
+    result = pd.DataFrame(rows).sort_values("درجة الإشارة", ascending=False)
+    st.subheader("📊 ملخص الأسهم")
+    st.dataframe(result, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ تنزيل النتائج CSV", result.to_csv(index=False).encode("utf-8-sig"),
+                       "egx_stock_analysis.csv", "text/csv")
+
+    st.subheader("🔎 تفاصيل كل سهم")
+    for sym, data, extra in details:
+        with st.expander(f"{sym} — التفاصيل", expanded=False):
+            if data is None:
+                st.warning(extra)
+                continue
+            last = data.iloc[-1]
+            label, score, reasons = signal_for(last)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("آخر إغلاق", f'{last["Close"]:.3f}')
+            c2.metric("RSI", f'{last["RSI"]:.1f}')
+            c3.metric("MACD", f'{last["MACD"]:.3f}')
+            c4.metric("الإشارة", label)
+            st.write("**أسباب الإشارة:**")
+            for reason in reasons:
+                st.write(f"- {reason}")
+            st.line_chart(data[["Close", "SMA20", "SMA50"]], use_container_width=True)
+            st.caption(f"آخر تاريخ متاح: {data.index[-1].strftime('%Y-%m-%d')} | ATR: {last['ATR']:.3f}")
+            st.caption("مستويات ATR إرشادية فقط؛ لا تأخذ في الاعتبار فجوات الأسعار أو حدود التذبذب أو السيولة.")
+
+elif details:
+    st.subheader("نتيجة جلب البيانات")
+    for sym, _, msg in details:
+        st.warning(f"{sym}: {msg}")
+
+st.divider()
+st.warning(
+    "تنبيه مهم: الإشارات والمؤشرات مبنية على بيانات تاريخية وقد تكون متأخرة أو غير مكتملة. "
+    "لا تمثل توصية شراء أو بيع، ولا تضمن الربح. تحققي من الأسعار والسيولة ومواعيد التداول "
+    "ومصدر بيانات موثوق قبل اتخاذ أي قرار، ولا تستثمري أموالًا لا تتحملين خسارتها."
+)
